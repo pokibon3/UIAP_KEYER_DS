@@ -158,10 +158,10 @@ char msgs[MSG_NUM][MSG_LEN + 1]; // メッセージバッファ
 //    }; // デフォルトメッセージ
 
 const char default_msgs[MSG_NUM][MSG_LEN] = {
-    "CQ CQ CQ DE JA1AOQ JA1AOQ JA1AOQ K",
-    "THIS IS A TEST MESSAGE FOR UIAPDUINO CW DECODER",
-    "A QUICK BROWN FOX JUMPES OVER THE LAZY DOG",
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/?.=+-@"
+    "CQ CQ CQ DE JA1AOQ JA1AOQ JA1AOQ K ",
+    "THIS IS A TEST MESSAGE FOR UIAPDUINO CW DECODER ",
+    "A QUICK BROWN FOX JUMPES OVER THE LAZY DOG ",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/?.=+-@ "
     }; // デフォルトメッセージ
 static uint8_t cur_msg = 0;  // 編集メモリ番号
 static uint8_t edit_pos = 0; // カーソル位置
@@ -228,8 +228,13 @@ volatile StopReason stop_reason = STOP_NONE;
 // リピート再生
 static bool repeat_mode = false;       // リピート再生中フラグ
 static uint8_t repeat_msg_idx = 0;     // リピート対象メッセージ番号
-static bool repeat_waiting = false;    // インターバル待機中フラグ
-static uint32_t repeat_wait_until = 0; // インターバル終了時刻 (tick単位)
+
+// 連続再生モード（SEQ）
+static bool seq_mode = false;          // 連続再生中フラグ
+static uint8_t seq_start_msg = 0;     // 開始メッセージ番号（ループ折り返し点）
+static uint8_t seq_cur_msg = 0;       // 現在再生中メッセージ番号
+static bool seq_waiting = false;      // メッセージ間インターバル待機中
+static uint32_t seq_wait_until = 0;   // インターバル終了時刻
 
 // スイッチの判定
 uint8_t sw_mask = 0; // スイッチ押しっぱなしをカウントしないためのマスク
@@ -756,9 +761,10 @@ uint8_t job_auto(void)
     typedef enum {
         AUTO_IDLE = 0,      // 次の文字取得
         AUTO_ELEM_ON,       // 要素(dit/dah) ON 中
-        AUTO_ELEM_OFF,      // 要素閁EOFF (1 dit)
+        AUTO_ELEM_OFF,      // 要素間OFF (1 dit)
         AUTO_CHAR_GAP,      // 文字間ギャップ (3 dit)
-        AUTO_WORD_GAP       // 単語間ギャップ (7 dit)
+        AUTO_WORD_GAP,      // 単語間ギャップ (7 dit)
+        AUTO_REPEAT_WAIT    // リピート待機中 (1秒インターバル)
     } auto_state_t;
 
     static auto_state_t state = AUTO_IDLE;
@@ -767,6 +773,7 @@ uint8_t job_auto(void)
     static const char *seq = nullptr;
     static uint8_t elem = 0;
     static uint16_t pos = 0;
+    static uint32_t gap_until = 0;   // リピート待機終了時刻
 
     // システムメッセージ中は固定速度
     // ※WPM 可変対応：毎回最新の key_spd を参照
@@ -781,6 +788,7 @@ uint8_t job_auto(void)
         seq = nullptr;
         elem = 0;
         pos = 0;
+        gap_until = 0;
         return 0;
     }
 
@@ -811,21 +819,28 @@ uint8_t job_auto(void)
 
                 // メッセージ終端
                 if (c == '\0') {
-                    auto_mode = false;
-                    req_reset_auto = true;
-                    auto_msg = NULL;
                     morse_len = 0;
-                    last_activity_tick = tim1_tick256;
                     cw_r = cw_w;
                     key_off_ticks = 0;
                     key_on_ticks = 0;
                     flush_done = true;
 
                     if (repeat_mode) {
-                        // リピートモード：mode=MODE_PLAYのまま
-                        // handle_play_mode() がインターバル後に再生する
+                        // リピートモード：1秒待機してから最初から再生
+                        state = AUTO_REPEAT_WAIT;
+                        gap_until = tim1_tick256 + 3906; // 1秒 = 3906×0.256ms
+                        half_rem = 0;
+                    } else if (seq_mode) {
+                        // 連続再生モード：handle_play_mode()が次のメッセージへ進める
+                        auto_mode = false;
+                        req_reset_auto = true;
+                        auto_msg = NULL;
+                        // mode = MODE_PLAY のまま維持
                     } else {
                         // 通常終了
+                        auto_mode = false;
+                        req_reset_auto = true;
+                        auto_msg = NULL;
                         sys_msg_active = false;
                         keyout_enabled = true;
                         mode = MODE_KEYER;
@@ -886,21 +901,27 @@ uint8_t job_auto(void)
                     char next = auto_msg[pos + 1];
 
                     if (next == '\0') {
-                        // メッセージ末尾 →ここで終了
-                        auto_mode = false;
-                        req_reset_auto = true;
-                        auto_msg = NULL;
-                        sys_msg_active = false;
-                        keyout_enabled = true;
-                        mode = MODE_KEYER;
-
+                        // メッセージ末尾
                         morse_len = 0;
                         cw_r = cw_w;
                         key_off_ticks = 0;
                         key_on_ticks = 0;
                         flush_done = true;
 
-                        //draw_keyer_screen();
+                        if (repeat_mode) {
+                            // リピートモード：1秒待機してから最初から再生
+                            state = AUTO_REPEAT_WAIT;
+                            gap_until = tim1_tick256 + 3906; // 1秒 = 3906×0.256ms
+                            half_rem = 0;
+                        } else {
+                            // 通常終了
+                            auto_mode = false;
+                            req_reset_auto = true;
+                            auto_msg = NULL;
+                            sys_msg_active = false;
+                            keyout_enabled = true;
+                            mode = MODE_KEYER;
+                        }
                         return 0;
                     } else if (next == ' ') {
                         // ※ここでスペースをつ表示する
@@ -936,6 +957,16 @@ uint8_t job_auto(void)
             case AUTO_WORD_GAP:
                 // 単語間ギャップ終了→次の文字へ
                 state = AUTO_IDLE;
+                break;
+
+            case AUTO_REPEAT_WAIT:
+                // リピート待機中：1秒経過したら最初から再生
+                if ((int32_t)(tim1_tick256 - gap_until) >= 0) {
+                    pos = 0;
+                    seq = nullptr;
+                    elem = 0;
+                    state = AUTO_IDLE;
+                }
                 break;
 
             default:
@@ -1561,37 +1592,74 @@ void handle_keyer_mode(void)
         return;
     }
 
-    /* メモリ再生 */
-    if (sw_mode == SW_INFO_CLICK && sw_stat == SW_1)
-    {
-        SW_CLEAR();
-        //printf("START PLAY MSG1\r\n");
-        mode = MODE_PLAY;
-        start_play(0);
+    // ---- クリック保留状態 ＆ ダブルクリック検出 ----
+    // ・1回目クリック：250ms 保留（ダブルクリック待ち）
+    // ・250ms 以内に同ボタン2回目 → 連続再生（SEQ）開始
+    // ・250ms タイムアウト → シングルクリック（メッセージ1曲再生）
+    // ・長押し発生時は保留をキャンセルし即座に長押し処理へ
+    static uint8_t  click_pending = 0;   // 保留中ボタン (0=なし)
+    static uint32_t click_tick    = 0;   // 1回目クリック時刻
+    #define SEQ_DBL_TICKS 977            // 250ms = 977×0.256ms
+
+    // -- 保留中の処理 --
+    if (click_pending != 0) {
+
+        // 長押しが来たら保留キャンセル → 長押し処理へ fall-through
+        if (sw_mode == SW_INFO_PRESS) {
+            click_pending = 0;
+            // fall-through continues to long-press block below
+        }
+        // 同じボタンを再クリック → ダブルクリック確定
+        else if (sw_mode == SW_INFO_CLICK && sw_stat == click_pending) {
+            uint8_t start = 0xff;
+            if      (click_pending == SW_1) start = 0;
+            else if (click_pending == SW_2) start = 1;
+            else if (click_pending == SW_3) start = 2;
+            else if (click_pending == SW_4) start = 3;
+            click_pending = 0;
+            if (start != 0xff) {
+                SW_CLEAR();
+                seq_mode      = true;
+                repeat_mode   = false;
+                seq_start_msg = start;
+                seq_cur_msg   = start;
+                seq_waiting   = false;
+                ssd1306_fillRect(0, 0, 56, 8, 0);
+                ssd1306_drawstr_sz(0, 0, "SEQ", 1, fontsize_8x8);
+                ssd1306_refresh();
+                start_play(start);
+            }
+            return;
+        }
+        // タイムアウト → シングルクリックとして処理
+        else if ((int32_t)(tim1_tick256 - click_tick) >= SEQ_DBL_TICKS) {
+            uint8_t btn = click_pending;
+            click_pending = 0;
+            uint8_t msg = 0xff;
+            if      (btn == SW_1) msg = 0;
+            else if (btn == SW_2) msg = 1;
+            else if (btn == SW_3) msg = 2;
+            else if (btn == SW_4) msg = 3;
+            if (msg != 0xff) {
+                SW_CLEAR();
+                mode = MODE_PLAY;
+                start_play(msg);
+            }
+            return;
+        }
+        // まだウィンドウ内 → 次のクリックまたはタイムアウト待ち
+        else {
+            return;
+        }
     }
 
-    if (sw_mode == SW_INFO_CLICK && sw_stat == SW_2)
+    // -- 新しいクリック → 250ms 保留開始 --
+    if (sw_mode == SW_INFO_CLICK &&
+        (sw_stat == SW_1 || sw_stat == SW_2 || sw_stat == SW_3 || sw_stat == SW_4))
     {
-        SW_CLEAR();
-        //printf("START PLAY MSG2\r\n");
-        mode = MODE_PLAY;
-        start_play(1);
-    }
-
-        if (sw_mode == SW_INFO_CLICK && sw_stat == SW_3)
-    {
-        SW_CLEAR();
-        //printf("START PLAY MSG3\r\n");
-        mode = MODE_PLAY;
-        start_play(2);
-    }
-
-    if (sw_mode == SW_INFO_CLICK && sw_stat == SW_4)
-    {
-        SW_CLEAR();
-        //printf("START PLAY MSG4\r\n");
-        mode = MODE_PLAY;
-        start_play(3);
+        click_pending = sw_stat;
+        click_tick    = tim1_tick256;
+        return;
     }
 
     // SWx 長押し → リピート再生開始
@@ -1603,13 +1671,14 @@ void handle_keyer_mode(void)
         else if (sw_mode == SW_INFO_PRESS && sw_stat == SW_4) rpt = 3;
         if (rpt != 0xff) {
             SW_CLEAR();
-            repeat_mode = true;
+            seq_mode      = false;
+            repeat_mode   = true;
             repeat_msg_idx = rpt;
             // タイトルを "RPT" に更新
             ssd1306_fillRect(0, 0, 56, 8, 0);
             ssd1306_drawstr_sz(0, 0, "RPT", 1, fontsize_8x8);
             ssd1306_refresh();
-            start_play(rpt);  // play_mem_msgより完全な初期化
+            start_play(rpt);
         }
     }
 }
@@ -1630,49 +1699,55 @@ void handle_play_mode(void)
         ignore_paddle_input = false;
     }
 
-    // 何か操作したら止める（リピートも解除）
+    // 何か操作したら止める（リピート・連続再生も解除）
     if (sw_is_pressed() || dot || dash || st)
     {
         SW_CLEAR();
         stop_play();
         repeat_mode = false;
-        repeat_waiting = false;
+        seq_mode    = false;
+        seq_waiting = false;
         mode = MODE_KEYER;
         draw_keyer_screen();
         ssd1306_refresh();
         return;
     }
 
-    // リピートインターバル待機中（1秒）
-    if (repeat_waiting)
+    // ---- 連続再生（SEQ）インターバル待機 ----
+    if (seq_waiting)
     {
-        if ((int32_t)(tim1_tick256 - repeat_wait_until) >= 0)
+        if ((int32_t)(tim1_tick256 - seq_wait_until) >= 0)
         {
-            // インターバル終了 → 再生開始（start_playで完全初期化）
-            repeat_waiting = false;
-            start_play(repeat_msg_idx);
+            seq_waiting  = false;
+            seq_cur_msg++;
+            if (seq_cur_msg >= MSG_NUM) seq_cur_msg = seq_start_msg; // 折り返し
+            // 次のメッセージ開始（テキストエリアをクリア）
+            ssd1306_fillRect(0, 8, 128, 56, 0);
+            ssd1306_refresh();
+            start_play(seq_cur_msg);
         }
         return;
     }
 
-    // 再生完了チェック（job_autoがauto_mode=falseにしたがmode=MODE_PLAYのまま）
-    if (!auto_mode)
+    // ---- 連続再生（SEQ）メッセージ完了 ----
+    // （job_auto が auto_mode=false にして mode=MODE_PLAY を維持する）
+    if (!auto_mode && seq_mode)
     {
-        if (repeat_mode)
-        {
-            // 1秒後に再生再開
-            repeat_waiting = true;
-            repeat_wait_until = tim1_tick256 + 3906; // 1秒 = 3906×0.256ms
-        }
-        else
-        {
-            stop_play();
-            mode = MODE_KEYER;
-            last_activity_tick = tim1_tick256;
-            flush_done = true;
-            key_off_ticks = 0;
-            key_on_ticks = 0;
-        }
+        seq_waiting    = true;
+        seq_wait_until = tim1_tick256 + 3906; // 1秒インターバル
+        return;
+    }
+
+    // ---- 非リピート・非SEQ再生完了チェック ----
+    // （リピートモードは job_auto 内の AUTO_REPEAT_WAIT で処理）
+    if (!auto_mode && !repeat_mode && !seq_mode)
+    {
+        stop_play();
+        mode = MODE_KEYER;
+        last_activity_tick = tim1_tick256;
+        flush_done = true;
+        key_off_ticks = 0;
+        key_on_ticks = 0;
     }
 }
 
@@ -1890,7 +1965,7 @@ void draw_startup_screen(void)
     ssd1306_drawstr_sz(0, 30, "Powered by", 1, fontsize_8x8);
     ssd1306_drawstr_sz(40, 40, "UIAPduino", 1, fontsize_8x8);
      ssd1306_drawFastHLine(0, 50, 128, 1);
-    ssd1306_drawstr_sz(0, 52, "Version 0.3", 1, fontsize_8x8);
+    ssd1306_drawstr_sz(0, 52, "Version 0.4", 1, fontsize_8x8);
     ssd1306_refresh();
 }
 
